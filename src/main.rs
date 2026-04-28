@@ -1,0 +1,807 @@
+#![allow(dead_code)]
+
+use clap::{Parser, Subcommand};
+use rayon::prelude::*;
+use rustc_hash::FxHashSet;
+use std::fs;
+use std::io::{self, Write};
+use std::time::Instant;
+
+const ALPHABET: [u8; 9] = *b"STROIEDCN";
+const MAX_EXPR_LEN: usize = 50_000;
+const HASH1_SEED: u64 = 0x9E37_79B1_85EB_CA87;
+const HASH2_SEED: u64 = 0xC2B2_AE3D_27D4_EB4F;
+const HASH1_MUL: u64 = 0x94D0_49BB_1331_11EB;
+const HASH2_MUL: u64 = 0x369D_EA0F_31A5_3F85;
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+enum Item {
+    Comb(u8),
+    Group(Box<Expr>),
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct Expr {
+    items: Vec<Item>,
+    flat_len: usize,
+    fp1: u64,
+    fp2: u64,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+struct Fingerprint {
+    flat_len: usize,
+    fp1: u64,
+    fp2: u64,
+}
+
+#[derive(Debug)]
+pub struct ReduceResult {
+    pub result: String,
+    pub steps: usize,
+    pub status: &'static str,
+}
+
+#[derive(Clone)]
+struct SearchHit {
+    expr: String,
+    out: String,
+    step: usize,
+    status: &'static str,
+}
+
+struct CandidateResult {
+    final_expr: Expr,
+    step: usize,
+    status: &'static str,
+}
+
+struct SearchAccumulator {
+    total_hits: usize,
+    limit: usize,
+    items: Vec<SearchHit>,
+}
+
+impl Item {
+    #[inline(always)]
+    fn flat_len(&self) -> usize {
+        match self {
+            Self::Comb(_) => 1,
+            Self::Group(expr) => expr.flat_len,
+        }
+    }
+
+    #[inline(always)]
+    fn fp1(&self) -> u64 {
+        match self {
+            Self::Comb(c) => 0xA24B_AED4_963E_E407u64 ^ ((*c as u64).wrapping_mul(HASH1_MUL)),
+            Self::Group(expr) => expr.fp1 ^ 0xC3A5_C85C_97CB_3127u64,
+        }
+    }
+
+    #[inline(always)]
+    fn fp2(&self) -> u64 {
+        match self {
+            Self::Comb(c) => 0x9FB2_1C65_1E98_DF25u64 ^ ((*c as u64).wrapping_mul(HASH2_MUL)),
+            Self::Group(expr) => expr.fp2 ^ 0xB492_B66F_BE98_F273u64,
+        }
+    }
+}
+
+impl Expr {
+    #[inline]
+    fn new(items: Vec<Item>) -> Self {
+        let mut expr = Self { items, flat_len: 0, fp1: 0, fp2: 0 };
+        expr.refresh();
+        expr
+    }
+
+    #[inline]
+    fn from_index(mut index: usize, len: usize) -> Self {
+        let mut items = vec![Item::Comb(ALPHABET[0]); len];
+        for slot in items.iter_mut().rev() {
+            *slot = Item::Comb(ALPHABET[index % ALPHABET.len()]);
+            index /= ALPHABET.len();
+        }
+        Self::new(items)
+    }
+
+    #[inline(always)]
+    fn fingerprint(&self) -> Fingerprint {
+        Fingerprint {
+            flat_len: self.flat_len,
+            fp1: self.fp1,
+            fp2: self.fp2,
+        }
+    }
+
+    #[inline]
+    fn refresh(&mut self) {
+        let mut flat_len = 0usize;
+        let mut fp1 = HASH1_SEED ^ (self.items.len() as u64);
+        let mut fp2 = HASH2_SEED ^ ((self.items.len() as u64).rotate_left(17));
+
+        for item in &self.items {
+            flat_len += item.flat_len();
+            fp1 = mix_hash(fp1, item.fp1(), HASH1_MUL);
+            fp2 = mix_hash(fp2, item.fp2(), HASH2_MUL);
+        }
+
+        self.flat_len = flat_len;
+        self.fp1 = fp1 ^ (flat_len as u64).wrapping_mul(HASH1_MUL);
+        self.fp2 = fp2 ^ (flat_len as u64).wrapping_mul(HASH2_MUL);
+    }
+
+    #[inline]
+    fn replace_consumed<I>(&mut self, pos: usize, consumed: usize, insert: I)
+    where
+        I: IntoIterator<Item = Item>,
+    {
+        let mut items = std::mem::take(&mut self.items);
+        let tail = items.split_off(pos + consumed);
+        items.truncate(pos);
+        items.extend(insert);
+        items.extend(tail);
+        self.items = items;
+        self.refresh();
+    }
+}
+
+impl SearchAccumulator {
+    fn new(limit: usize) -> Self {
+        Self {
+            total_hits: 0,
+            limit,
+            items: if limit == 0 { Vec::new() } else { Vec::with_capacity(limit) },
+        }
+    }
+
+    #[inline]
+    fn record(&mut self, index: usize, length: usize, result: CandidateResult) {
+        self.total_hits += 1;
+
+        if self.limit == 0 {
+            self.items.push(make_search_hit(index, length, result));
+            return;
+        }
+
+        if self.items.len() < self.limit {
+            self.items.push(make_search_hit(index, length, result));
+            return;
+        }
+
+        let min_index = self.min_index();
+        if result.step > self.items[min_index].step {
+            self.items[min_index] = make_search_hit(index, length, result);
+        }
+    }
+
+    #[inline]
+    fn merge(mut self, other: Self) -> Self {
+        self.total_hits += other.total_hits;
+
+        if self.limit == 0 {
+            self.items.extend(other.items);
+            return self;
+        }
+
+        for hit in other.items {
+            self.consider_hit(hit);
+        }
+
+        self
+    }
+
+    #[inline]
+    fn consider_hit(&mut self, hit: SearchHit) {
+        if self.items.len() < self.limit {
+            self.items.push(hit);
+            return;
+        }
+
+        let min_index = self.min_index();
+        if hit.step > self.items[min_index].step {
+            self.items[min_index] = hit;
+        }
+    }
+
+    #[inline]
+    fn min_index(&self) -> usize {
+        let mut min_index = 0usize;
+        let mut min_step = self.items[0].step;
+
+        for (idx, hit) in self.items.iter().enumerate().skip(1) {
+            if hit.step < min_step {
+                min_step = hit.step;
+                min_index = idx;
+            }
+        }
+
+        min_index
+    }
+}
+
+#[inline(always)]
+fn mix_hash(hash: u64, value: u64, mul: u64) -> u64 {
+    (hash ^ value.wrapping_mul(mul)).rotate_left(27).wrapping_mul(mul)
+}
+
+#[inline]
+fn group_from_items(mut items: Vec<Item>) -> Item {
+    if items.len() == 1 {
+        items.pop().unwrap()
+    } else {
+        Item::Group(Box::new(Expr::new(items)))
+    }
+}
+
+#[inline]
+fn expand_item(item: &Item) -> Vec<Item> {
+    match item {
+        Item::Comb(c) => vec![Item::Comb(*c)],
+        Item::Group(expr) => expr.items.clone(),
+    }
+}
+
+#[inline]
+fn parse(s: &str) -> Expr {
+    let mut stack: Vec<Vec<Item>> = vec![Vec::with_capacity(s.len())];
+
+    for b in s.bytes() {
+        match b {
+            b'(' => stack.push(Vec::new()),
+            b')' => {
+                if stack.len() > 1 {
+                    let items = stack.pop().unwrap();
+                    stack.last_mut().unwrap().push(group_from_items(items));
+                }
+            }
+            b if b.is_ascii_whitespace() => {}
+            _ => stack.last_mut().unwrap().push(Item::Comb(b)),
+        }
+    }
+
+    while stack.len() > 1 {
+        let items = stack.pop().unwrap();
+        stack.last_mut().unwrap().push(group_from_items(items));
+    }
+
+    Expr::new(stack.pop().unwrap())
+}
+
+#[inline]
+fn push_item_string(item: &Item, out: &mut String) {
+    match item {
+        Item::Comb(c) => out.push(*c as char),
+        Item::Group(expr) => {
+            out.push('(');
+            for child in &expr.items {
+                push_item_string(child, out);
+            }
+            out.push(')');
+        }
+    }
+}
+
+#[inline]
+fn stringify(expr: &Expr) -> String {
+    let mut out = String::with_capacity(expr.flat_len + expr.items.len());
+    for item in &expr.items {
+        push_item_string(item, &mut out);
+    }
+    out
+}
+
+#[inline]
+fn expr_len(expr: &Expr) -> usize {
+    expr.flat_len
+}
+
+#[inline]
+fn apply_rule(expr: &mut Expr, pos: usize, c: u8) -> bool {
+    let rest_len = expr.items.len() - pos - 1;
+
+    match c {
+        b'R' if rest_len >= 1 => {
+            let x = expr.items[pos + 1].clone();
+            expr.replace_consumed(pos, 2, [x.clone(), x]);
+            true
+        }
+        b'E' if rest_len >= 2 => {
+            expr.replace_consumed(pos, 2, std::iter::empty::<Item>());
+            true
+        }
+        b'S' if rest_len >= 2 => {
+            let x = expr.items[pos + 1].clone();
+            let y = expr.items[pos + 2].clone();
+
+            let mut xx_items = expand_item(&x);
+            xx_items.extend(expand_item(&x));
+            let xx = group_from_items(xx_items);
+
+            let mut yy_items = expand_item(&y);
+            yy_items.extend(expand_item(&y));
+            let yy = group_from_items(yy_items);
+
+            expr.replace_consumed(pos, 3, [xx.clone(), yy, xx]);
+            true
+        }
+        b'O' if rest_len >= 2 => {
+            let x = expr.items[pos + 1].clone();
+            let y = expr.items[pos + 2].clone();
+
+            let mut yx_items = expand_item(&y);
+            yx_items.push(x.clone());
+            let yx = group_from_items(yx_items);
+
+            expr.replace_consumed(pos, 3, [x.clone(), yx, x, y]);
+            true
+        }
+        b'I' if rest_len >= 3 => {
+            let x = expr.items[pos + 1].clone();
+            let y = expr.items[pos + 2].clone();
+            let z = expr.items[pos + 3].clone();
+
+            let mut xz_items = expand_item(&x);
+            xz_items.push(z);
+            let xz = group_from_items(xz_items);
+
+            expr.replace_consumed(pos, 4, [y, xz]);
+            true
+        }
+        b'D' if rest_len >= 3 => {
+            let x = expr.items[pos + 1].clone();
+            let y = expr.items[pos + 2].clone();
+            let z = expr.items[pos + 3].clone();
+
+            let mut yyz_items = expand_item(&y);
+            yyz_items.extend(expand_item(&y));
+            yyz_items.push(z);
+            let yyz = group_from_items(yyz_items);
+
+            expr.replace_consumed(pos, 4, [x.clone(), x, yyz]);
+            true
+        }
+        b'T' if rest_len >= 2 => {
+            let a = expr.items[pos + 1].clone();
+            let mut items = std::mem::take(&mut expr.items);
+            let tail = items.split_off(pos + 2);
+            items.truncate(pos);
+            items.extend(tail);
+            items.push(a);
+            expr.items = items;
+            expr.refresh();
+            true
+        }
+        b'C' if rest_len >= 1 => {
+            let a = expr.items[pos + 1].clone();
+            let mut items = std::mem::take(&mut expr.items);
+            let tail = items.split_off(pos + 1);
+            items.truncate(pos);
+            items.extend(tail);
+            items.push(a);
+            expr.items = items;
+            expr.refresh();
+            true
+        }
+        b'N' if rest_len >= 1 => {
+            let mut items = std::mem::take(&mut expr.items);
+            let mut tail = items.split_off(pos + 1);
+            items.truncate(pos);
+            tail.reverse();
+            items.extend(tail);
+            expr.items = items;
+            expr.refresh();
+            true
+        }
+        _ => false,
+    }
+}
+
+fn reduce_once(expr: &mut Expr) -> bool {
+    let top_len = expr.items.len();
+    let mut i = 0usize;
+
+    while i < top_len {
+        let c = match &expr.items[i] {
+            Item::Comb(c) => *c,
+            Item::Group(_) => {
+                i += 1;
+                continue;
+            }
+        };
+
+        if apply_rule(expr, i, c) {
+            return true;
+        }
+
+        i += 1;
+    }
+
+    let child_len = expr.items.len();
+    let mut i = 0usize;
+
+    while i < child_len {
+        let mut replacement = None;
+        let mut reduced = false;
+
+        match &mut expr.items[i] {
+            Item::Comb(_) => {}
+            Item::Group(inner) => {
+                if reduce_once(inner) {
+                    reduced = true;
+                    if inner.items.len() == 1 {
+                        replacement = inner.items.pop();
+                    }
+                }
+            }
+        }
+
+        if reduced {
+            if let Some(item) = replacement {
+                expr.items[i] = item;
+            }
+            expr.refresh();
+            return true;
+        }
+
+        i += 1;
+    }
+
+    false
+}
+
+fn render_truncated(expr: &Expr) -> String {
+    let rendered = stringify(expr);
+    let end = rendered.len().min(100);
+    format!("{}... (truncated)", &rendered[..end])
+}
+
+fn reduce_full(s: &str, max_steps: usize) -> ReduceResult {
+    let mut expr = parse(s);
+    let mut seen = FxHashSet::default();
+    seen.insert(expr.fingerprint());
+
+    let mut step = 0usize;
+    while step < max_steps {
+        let prev = expr.fingerprint();
+
+        if !reduce_once(&mut expr) {
+            return ReduceResult { result: stringify(&expr), steps: step, status: "normal" };
+        }
+
+        let next = expr.fingerprint();
+        if next == prev {
+            return ReduceResult { result: stringify(&expr), steps: step, status: "fixed_point" };
+        }
+
+        if expr_len(&expr) > MAX_EXPR_LEN {
+            return ReduceResult { result: render_truncated(&expr), steps: step, status: "limit_reached" };
+        }
+
+        step += 1;
+        if !seen.insert(next) {
+            return ReduceResult { result: stringify(&expr), steps: step, status: "cycle" };
+        }
+    }
+
+    ReduceResult { result: stringify(&expr), steps: step, status: "limit_reached" }
+}
+
+fn reduce_search_candidate(index: usize, length: usize, max_steps: usize) -> CandidateResult {
+    let mut expr = Expr::from_index(index, length);
+    let mut seen = FxHashSet::default();
+    seen.insert(expr.fingerprint());
+
+    let mut step = 0usize;
+    let mut min_len_this_epoch = expr.flat_len;
+    let mut epochs = [usize::MAX; 3];
+    let mut epoch_count = 0usize;
+
+    while step < max_steps {
+        if expr.flat_len < min_len_this_epoch {
+            min_len_this_epoch = expr.flat_len;
+        }
+
+        if step > 0 && step % 100 == 0 {
+            epochs[epoch_count % 3] = min_len_this_epoch;
+            epoch_count += 1;
+            min_len_this_epoch = usize::MAX;
+
+            if epoch_count >= 3 {
+                let a = epochs[(epoch_count - 3) % 3];
+                let b = epochs[(epoch_count - 2) % 3];
+                let c = epochs[(epoch_count - 1) % 3];
+                if a < b && b < c {
+                    return CandidateResult { final_expr: expr, step, status: "divergent" };
+                }
+            }
+        }
+
+        let prev = expr.fingerprint();
+        if !reduce_once(&mut expr) {
+            return CandidateResult { final_expr: expr, step, status: "normal" };
+        }
+
+        let next = expr.fingerprint();
+        if next == prev {
+            return CandidateResult { final_expr: expr, step, status: "fixed_point" };
+        }
+
+        if expr.flat_len > MAX_EXPR_LEN {
+            return CandidateResult { final_expr: expr, step, status: "limit_reached" };
+        }
+
+        step += 1;
+        if !seen.insert(next) {
+            return CandidateResult { final_expr: expr, step, status: "cycle" };
+        }
+    }
+
+    CandidateResult { final_expr: expr, step, status: "limit_reached" }
+}
+
+#[inline]
+fn index_to_string(mut index: usize, length: usize) -> String {
+    let mut bytes = vec![ALPHABET[0]; length];
+    for slot in bytes.iter_mut().rev() {
+        *slot = ALPHABET[index % ALPHABET.len()];
+        index /= ALPHABET.len();
+    }
+    String::from_utf8(bytes).unwrap()
+}
+
+#[inline]
+fn make_search_hit(index: usize, length: usize, result: CandidateResult) -> SearchHit {
+    SearchHit {
+        expr: index_to_string(index, length),
+        out: stringify(&result.final_expr),
+        step: result.step,
+        status: result.status,
+    }
+}
+
+#[derive(Parser)]
+#[command(name = "stoicn", about = "STROIED-CN Interpreter & Toolkit (Rust engine)", version)]
+struct Cli {
+    #[command(subcommand)]
+    command: Commands,
+}
+
+#[derive(Subcommand)]
+enum Commands {
+    /// Run a .stoicn file
+    Run {
+        file: String,
+        #[arg(long, default_value_t = 500)]
+        max_steps: usize,
+    },
+    /// Evaluate a single expression
+    Eval {
+        expression: Vec<String>,
+        #[arg(long, default_value_t = 500)]
+        max_steps: usize,
+    },
+    /// Interactive REPL
+    Repl {
+        #[arg(long, default_value_t = 500)]
+        max_steps: usize,
+    },
+    /// Enumerate all strings of given length
+    Search {
+        length: usize,
+        #[arg(long, default_value_t = 50)]
+        max_steps: usize,
+        #[arg(long)]
+        filter: Option<String>,
+        #[arg(long, alias = "set-LBlength", default_value_t = 10)]
+        limit: usize,
+        #[arg(long)]
+        threads: Option<usize>,
+    },
+    /// Run benchmark tests
+    Bench,
+}
+
+fn main() {
+    let cli = Cli::parse();
+
+    match &cli.command {
+        Commands::Eval { expression, max_steps } => {
+            let expr = expression.join("");
+            println!("======================================================");
+            println!("  STROIED-CN Interpreter (Rust)");
+            println!("======================================================");
+            println!("  Expression: {}\n", expr);
+            let start = Instant::now();
+            let res = reduce_full(&expr, *max_steps);
+            let elapsed = start.elapsed();
+            println!("  Result: {}", res.result);
+            println!("  Steps: {}, Status: {}", res.steps, res.status);
+            println!("  Time: {:.4}s\n", elapsed.as_secs_f64());
+        }
+        Commands::Run { file, max_steps } => {
+            let content = fs::read_to_string(file).expect("Failed to read file");
+            println!("======================================================");
+            println!("  STROIED-CN Interpreter (Rust)");
+            println!("======================================================");
+            for (i, line) in content.lines().enumerate() {
+                let line = line.trim();
+                if line.is_empty() || line.starts_with('#') {
+                    continue;
+                }
+                println!("> Line {}: {}", i + 1, line);
+                let start = Instant::now();
+                let res = reduce_full(line, *max_steps);
+                let elapsed = start.elapsed();
+                println!("  Result: {}", res.result);
+                println!("  Steps: {} | Time: {:.4}s\n", res.steps, elapsed.as_secs_f64());
+            }
+        }
+        Commands::Repl { max_steps } => {
+            println!("======================================================");
+            println!("  STROIED-CN REPL (Rust)");
+            println!("======================================================");
+            println!("  Type an expression and press Enter.");
+            println!("  Commands: :quit  :help\n");
+
+            loop {
+                print!("stoicn> ");
+                io::stdout().flush().unwrap();
+
+                let mut input = String::new();
+                if io::stdin().read_line(&mut input).is_err() || input.trim().is_empty() {
+                    continue;
+                }
+
+                let input = input.trim();
+                if input == ":quit" {
+                    break;
+                }
+                if input == ":help" {
+                    println!("S T R O I E D C N");
+                    continue;
+                }
+
+                let start = Instant::now();
+                let mut expr = parse(input);
+                let mut seen = FxHashSet::default();
+                seen.insert(expr.fingerprint());
+
+                let mut step = 0usize;
+                let mut status = "limit_reached";
+
+                while step < *max_steps {
+                    let prev = expr.fingerprint();
+
+                    if !reduce_once(&mut expr) {
+                        status = "normal";
+                        break;
+                    }
+
+                    let next = expr.fingerprint();
+                    if next == prev {
+                        status = "fixed_point";
+                        break;
+                    }
+
+                    if expr_len(&expr) > MAX_EXPR_LEN {
+                        status = "limit_reached";
+                        break;
+                    }
+
+                    step += 1;
+                    if !seen.insert(next) {
+                        status = "cycle";
+                        break;
+                    }
+                }
+
+                let elapsed = start.elapsed();
+                println!("  Result: {}", stringify(&expr));
+                println!("  Steps: {}, Status: {}, Time: {:.4}s\n", step, status, elapsed.as_secs_f64());
+            }
+        }
+        Commands::Search { length, max_steps, filter, limit, threads } => {
+            println!("======================================================");
+            println!("  STROIED-CN Search (length={})", length);
+            println!("======================================================");
+
+            let total = ALPHABET.len().pow(*length as u32);
+            println!("  Total expressions: {}", total);
+
+            let start = Instant::now();
+            let filter = filter.as_deref();
+            let keep_limit = *limit;
+
+            let search_job = || {
+                (0..total)
+                    .into_par_iter()
+                    .fold(
+                        || SearchAccumulator::new(keep_limit),
+                        |mut acc, index| {
+                            let result = reduce_search_candidate(index, *length, *max_steps);
+                            let keep = match filter {
+                                Some(wanted) => wanted == result.status,
+                                None => true,
+                            };
+
+                            if keep {
+                                acc.record(index, *length, result);
+                            }
+
+                            acc
+                        },
+                    )
+                    .reduce(
+                        || SearchAccumulator::new(keep_limit),
+                        |left, right| left.merge(right),
+                    )
+            };
+
+            let mut hits = if let Some(t) = threads {
+                rayon::ThreadPoolBuilder::new()
+                    .num_threads(*t)
+                    .build()
+                    .unwrap()
+                    .install(search_job)
+            } else {
+                search_job()
+            };
+
+            hits.items.sort_by(|a, b| {
+                b.step
+                    .cmp(&a.step)
+                    .then_with(|| a.expr.cmp(&b.expr))
+                    .then_with(|| a.status.cmp(b.status))
+            });
+
+            let display_limit = if *limit == 0 { hits.items.len() } else { *limit };
+            for hit in hits.items.iter().take(display_limit) {
+                let display_out = if hit.out.len() > 40 {
+                    format!("{}...", &hit.out[..37])
+                } else {
+                    hit.out.clone()
+                };
+                println!("  {:12} {:40} {:5}  {}", hit.expr, display_out, hit.step, hit.status);
+            }
+
+            let elapsed = start.elapsed();
+            println!(
+                "\n  Found {} matches in {:.4}s ({} exprs/sec)",
+                hits.total_hits,
+                elapsed.as_secs_f64(),
+                (total as f64 / elapsed.as_secs_f64()) as u64
+            );
+        }
+        Commands::Bench => {
+            println!("Running benchmarks...");
+            let tests = [
+                ("DDDDD", 500),
+                ("DDDDDD", 500),
+                ("SDSD", 500),
+                ("SDSDS", 500),
+                ("DSDSD", 500),
+                ("OSOSOS", 200),
+                ("SSSSSSSS", 200),
+                ("DSDSDSDS", 200),
+                ("SODSODSOD", 100),
+            ];
+
+            for (expr, limit) in tests {
+                let start = Instant::now();
+                let res = reduce_full(expr, limit);
+                let elapsed = start.elapsed();
+                println!(
+                    "{:15} ms={:4}, steps={:4}, status={:14}, len={:8}, time={:.4}s",
+                    expr,
+                    limit,
+                    res.steps,
+                    res.status,
+                    res.result.len(),
+                    elapsed.as_secs_f64()
+                );
+            }
+        }
+    }
+}
