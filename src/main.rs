@@ -17,6 +17,7 @@ const HASH2_MUL: u64 = 0x369D_EA0F_31A5_3F85;
 const INLINE_SEEN_CAP: usize = 64;
 const TRUNCATED_RENDER_LEN: usize = 100;
 const SEARCH_PREVIEW_LEN: usize = 40;
+const STABLE_CYCLE_CHECK_STEPS: usize = 4;
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 enum Item {
@@ -34,12 +35,11 @@ struct Expr {
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 struct Fingerprint {
-    flat_len: usize,
-    fp1: u64,
-    fp2: u64,
+    hi: u64,
+    lo: u64,
 }
 
-const EMPTY_FINGERPRINT: Fingerprint = Fingerprint { flat_len: 0, fp1: 0, fp2: 0 };
+const EMPTY_FINGERPRINT: Fingerprint = Fingerprint { hi: 0, lo: 0 };
 
 struct SeenFingerprints {
     inline: [Fingerprint; INLINE_SEEN_CAP],
@@ -121,9 +121,8 @@ impl Expr {
     #[inline(always)]
     fn fingerprint(&self) -> Fingerprint {
         Fingerprint {
-            flat_len: self.flat_len,
-            fp1: self.fp1,
-            fp2: self.fp2,
+            hi: self.fp1 ^ (self.flat_len as u64).wrapping_mul(HASH1_MUL),
+            lo: self.fp2 ^ ((self.flat_len as u64).rotate_left(17)).wrapping_mul(HASH2_MUL),
         }
     }
 
@@ -200,9 +199,7 @@ impl SeenFingerprints {
 
 #[inline(always)]
 fn fingerprint_slot(fp: Fingerprint) -> usize {
-    let mixed = fp.fp1
-        ^ fp.fp2.rotate_left(31)
-        ^ (fp.flat_len as u64).wrapping_mul(HASH1_MUL);
+    let mixed = fp.hi ^ fp.lo.rotate_left(31);
     (mixed as usize) & (INLINE_SEEN_CAP - 1)
 }
 
@@ -417,7 +414,7 @@ fn expr_len(expr: &Expr) -> usize {
 }
 
 #[inline]
-fn apply_rule(expr: &mut Expr, pos: usize, c: u8) -> bool {
+fn apply_rule(expr: &mut Expr, pos: usize, c: u8, step_budget: usize) -> usize {
     let rest_len = expr.items.len() - pos - 1;
 
     match c {
@@ -426,12 +423,12 @@ fn apply_rule(expr: &mut Expr, pos: usize, c: u8) -> bool {
             expr.items[pos] = x.clone();
             expr.items[pos + 1] = x;
             expr.refresh();
-            true
+            1
         }
         b'E' if rest_len >= 2 => {
             expr.items.drain(pos..pos + 2);
             expr.refresh();
-            true
+            1
         }
         b'S' if rest_len >= 2 => {
             let x = expr.items[pos + 1].clone();
@@ -442,7 +439,7 @@ fn apply_rule(expr: &mut Expr, pos: usize, c: u8) -> bool {
             let yy = group_from_items(expanded_twice(&y));
 
             expr.replace_consumed(pos, 3, [xx.clone(), yy, xx]);
-            true
+            1
         }
         b'O' if rest_len >= 2 => {
             let x = expr.items[pos + 1].clone();
@@ -458,7 +455,7 @@ fn apply_rule(expr: &mut Expr, pos: usize, c: u8) -> bool {
             let yx = group_from_items(yx_items);
 
             expr.replace_consumed(pos, 3, [x.clone(), yx, x, y]);
-            true
+            1
         }
         b'I' if rest_len >= 3 => {
             let x = expr.items[pos + 1].clone();
@@ -475,7 +472,7 @@ fn apply_rule(expr: &mut Expr, pos: usize, c: u8) -> bool {
             let xz = group_from_items(xz_items);
 
             expr.replace_consumed(pos, 4, [y, xz]);
-            true
+            1
         }
         b'D' if rest_len >= 3 => {
             let x = expr.items[pos + 1].clone();
@@ -493,29 +490,35 @@ fn apply_rule(expr: &mut Expr, pos: usize, c: u8) -> bool {
             let yyz = group_from_items(yyz_items);
 
             expr.replace_consumed(pos, 4, [x.clone(), x, yyz]);
-            true
+            1
         }
         b'T' if rest_len >= 2 => {
             let a = expr.items[pos + 1].clone();
             expr.items.drain(pos..pos + 2);
             expr.items.push(a);
             expr.refresh();
-            true
+            1
         }
         b'C' if rest_len >= 1 => {
+            if step_budget >= 2 && rest_len >= 2 && matches!(expr.items[pos + 1], Item::Comb(b'R')) {
+                let x = expr.items[pos + 2].clone();
+                expr.items.splice(pos..pos + 3, [x.clone(), x, Item::Comb(b'R')]);
+                expr.refresh();
+                return 2;
+            }
             let a = expr.items[pos + 1].clone();
             expr.items.remove(pos);
             expr.items.push(a);
             expr.refresh();
-            true
+            1
         }
         b'N' if rest_len >= 1 => {
             expr.items.remove(pos);
             expr.items[pos..].reverse();
             expr.refresh();
-            true
+            1
         }
-        _ => false,
+        _ => 0,
     }
 }
 
@@ -545,7 +548,7 @@ fn has_redex(expr: &Expr) -> bool {
     })
 }
 
-fn reduce_once(expr: &mut Expr) -> bool {
+fn reduce_once(expr: &mut Expr, step_budget: usize) -> usize {
     let top_len = expr.items.len();
     let mut i = 0usize;
 
@@ -558,8 +561,9 @@ fn reduce_once(expr: &mut Expr) -> bool {
             }
         };
 
-        if apply_rule(expr, i, c) {
-            return true;
+        let steps = apply_rule(expr, i, c, step_budget);
+        if steps != 0 {
+            return steps;
         }
 
         i += 1;
@@ -570,7 +574,6 @@ fn reduce_once(expr: &mut Expr) -> bool {
 
     while i < child_len {
         let mut replacement = None;
-        let mut reduced = false;
 
         match &mut expr.items[i] {
             Item::Comb(_) => {}
@@ -580,31 +583,44 @@ fn reduce_once(expr: &mut Expr) -> bool {
                     continue;
                 }
                 let inner = Arc::make_mut(inner);
-                if reduce_once(inner) {
-                    reduced = true;
+                let steps = reduce_once(inner, step_budget);
+                if steps != 0 {
                     if inner.items.len() == 1 {
                         replacement = inner.items.pop();
                     }
+                    if let Some(item) = replacement {
+                        expr.items[i] = item;
+                    }
+                    expr.refresh();
+                    return steps;
                 }
             }
-        }
-
-        if reduced {
-            if let Some(item) = replacement {
-                expr.items[i] = item;
-            }
-            expr.refresh();
-            return true;
         }
 
         i += 1;
     }
 
-    false
+    0
 }
 
 fn render_truncated(expr: &Expr) -> String {
     format!("{}... (truncated)", stringify_prefix(expr, TRUNCATED_RENDER_LEN))
+}
+
+#[inline]
+fn should_checkpoint_cycle(prev_len: usize, next_len: usize, stable_steps: &mut usize) -> bool {
+    if next_len < prev_len {
+        *stable_steps = 0;
+        return true;
+    }
+
+    if next_len == prev_len {
+        *stable_steps += 1;
+        return *stable_steps >= STABLE_CYCLE_CHECK_STEPS;
+    }
+
+    *stable_steps = 0;
+    false
 }
 
 fn reduce_full(s: &str, max_steps: usize, max_len: usize) -> ReduceResult {
@@ -613,10 +629,13 @@ fn reduce_full(s: &str, max_steps: usize, max_len: usize) -> ReduceResult {
     seen.insert(expr.fingerprint());
 
     let mut step = 0usize;
+    let mut stable_steps = 0usize;
     while step < max_steps {
         let prev = expr.fingerprint();
+        let prev_len = expr.flat_len;
 
-        if !reduce_once(&mut expr) {
+        let step_delta = reduce_once(&mut expr, max_steps - step);
+        if step_delta == 0 {
             return ReduceResult { result: stringify(&expr), steps: step, status: "normal" };
         }
 
@@ -629,8 +648,8 @@ fn reduce_full(s: &str, max_steps: usize, max_len: usize) -> ReduceResult {
             return ReduceResult { result: render_truncated(&expr), steps: step, status: "limit_reached" };
         }
 
-        step += 1;
-        if !seen.insert(next) {
+        step = (step + step_delta).min(max_steps);
+        if should_checkpoint_cycle(prev_len, expr.flat_len, &mut stable_steps) && !seen.insert(next) {
             return ReduceResult { result: stringify(&expr), steps: step, status: "cycle" };
         }
     }
@@ -647,6 +666,7 @@ fn reduce_search_candidate(index: usize, length: usize, max_steps: usize, max_le
     let mut min_len_this_epoch = expr.flat_len;
     let mut epochs = [usize::MAX; 3];
     let mut epoch_count = 0usize;
+    let mut stable_steps = 0usize;
 
     while step < max_steps {
         if expr.flat_len < min_len_this_epoch {
@@ -669,7 +689,9 @@ fn reduce_search_candidate(index: usize, length: usize, max_steps: usize, max_le
         }
 
         let prev = expr.fingerprint();
-        if !reduce_once(&mut expr) {
+        let prev_len = expr.flat_len;
+        let step_delta = reduce_once(&mut expr, max_steps - step);
+        if step_delta == 0 {
             return CandidateResult { final_expr: expr, step, status: "normal" };
         }
 
@@ -682,8 +704,8 @@ fn reduce_search_candidate(index: usize, length: usize, max_steps: usize, max_le
             return CandidateResult { final_expr: expr, step, status: "limit_reached" };
         }
 
-        step += 1;
-        if !seen.insert(next) {
+        step = (step + step_delta).min(max_steps);
+        if should_checkpoint_cycle(prev_len, expr.flat_len, &mut stable_steps) && !seen.insert(next) {
             return CandidateResult { final_expr: expr, step, status: "cycle" };
         }
     }
@@ -828,11 +850,14 @@ fn main() {
 
                 let mut step = 0usize;
                 let mut status = "limit_reached";
+                let mut stable_steps = 0usize;
 
                 while step < *max_steps {
                     let prev = expr.fingerprint();
+                    let prev_len = expr.flat_len;
 
-                    if !reduce_once(&mut expr) {
+                    let step_delta = reduce_once(&mut expr, *max_steps - step);
+                    if step_delta == 0 {
                         status = "normal";
                         break;
                     }
@@ -848,8 +873,8 @@ fn main() {
                         break;
                     }
 
-                    step += 1;
-                    if !seen.insert(next) {
+                    step = (step + step_delta).min(*max_steps);
+                    if should_checkpoint_cycle(prev_len, expr.flat_len, &mut stable_steps) && !seen.insert(next) {
                         status = "cycle";
                         break;
                     }
