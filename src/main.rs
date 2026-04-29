@@ -5,6 +5,7 @@ use rayon::prelude::*;
 use rustc_hash::FxHashSet;
 use std::fs;
 use std::io::{self, Write};
+use std::sync::Arc;
 use std::time::Instant;
 
 const ALPHABET: [u8; 9] = *b"STROIEDCN";
@@ -13,11 +14,14 @@ const HASH1_SEED: u64 = 0x9E37_79B1_85EB_CA87;
 const HASH2_SEED: u64 = 0xC2B2_AE3D_27D4_EB4F;
 const HASH1_MUL: u64 = 0x94D0_49BB_1331_11EB;
 const HASH2_MUL: u64 = 0x369D_EA0F_31A5_3F85;
+const INLINE_SEEN_CAP: usize = 64;
+const TRUNCATED_RENDER_LEN: usize = 100;
+const SEARCH_PREVIEW_LEN: usize = 40;
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 enum Item {
     Comb(u8),
-    Group(Box<Expr>),
+    Group(Arc<Expr>),
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -33,6 +37,14 @@ struct Fingerprint {
     flat_len: usize,
     fp1: u64,
     fp2: u64,
+}
+
+const EMPTY_FINGERPRINT: Fingerprint = Fingerprint { flat_len: 0, fp1: 0, fp2: 0 };
+
+struct SeenFingerprints {
+    inline: [Fingerprint; INLINE_SEEN_CAP],
+    len: usize,
+    spill: Option<FxHashSet<Fingerprint>>,
 }
 
 #[derive(Debug)]
@@ -137,14 +149,61 @@ impl Expr {
     where
         I: IntoIterator<Item = Item>,
     {
-        let mut items = std::mem::take(&mut self.items);
-        let tail = items.split_off(pos + consumed);
-        items.truncate(pos);
-        items.extend(insert);
-        items.extend(tail);
-        self.items = items;
+        self.items.splice(pos..pos + consumed, insert);
         self.refresh();
     }
+}
+
+impl SeenFingerprints {
+    #[inline]
+    fn new() -> Self {
+        Self {
+            inline: [EMPTY_FINGERPRINT; INLINE_SEEN_CAP],
+            len: 0,
+            spill: None,
+        }
+    }
+
+    #[inline]
+    fn insert(&mut self, fp: Fingerprint) -> bool {
+        if let Some(spill) = &mut self.spill {
+            return spill.insert(fp);
+        }
+
+        if self.len < INLINE_SEEN_CAP {
+            let mut idx = fingerprint_slot(fp);
+            loop {
+                if self.inline[idx] == EMPTY_FINGERPRINT {
+                    self.inline[idx] = fp;
+                    self.len += 1;
+                    return true;
+                }
+                if self.inline[idx] == fp {
+                    return false;
+                }
+                idx = (idx + 1) & (INLINE_SEEN_CAP - 1);
+            }
+        }
+
+        let mut spill = FxHashSet::default();
+        spill.reserve(INLINE_SEEN_CAP * 2);
+        for existing in &self.inline {
+            if *existing != EMPTY_FINGERPRINT {
+                spill.insert(*existing);
+            }
+        }
+        let inserted = spill.insert(fp);
+        self.spill = Some(spill);
+        inserted
+    }
+}
+
+#[inline(always)]
+fn fingerprint_slot(fp: Fingerprint) -> usize {
+    let mixed = fp.fp1
+        ^ fp.fp2.rotate_left(31)
+        ^ (fp.flat_len as u64).wrapping_mul(HASH1_MUL);
+    (mixed as usize) & (INLINE_SEEN_CAP - 1)
 }
 
 impl SearchAccumulator {
@@ -231,7 +290,7 @@ fn group_from_items(mut items: Vec<Item>) -> Item {
     if items.len() == 1 {
         items.pop().unwrap()
     } else {
-        Item::Group(Box::new(Expr::new(items)))
+        Item::Group(Arc::new(Expr::new(items)))
     }
 }
 
@@ -241,6 +300,26 @@ fn expand_item(item: &Item) -> Vec<Item> {
         Item::Comb(c) => vec![Item::Comb(*c)],
         Item::Group(expr) => expr.items.clone(),
     }
+}
+
+#[inline]
+fn append_expanded(item: &Item, out: &mut Vec<Item>) {
+    match item {
+        Item::Comb(c) => out.push(Item::Comb(*c)),
+        Item::Group(expr) => out.extend(expr.items.iter().cloned()),
+    }
+}
+
+#[inline]
+fn expanded_twice(item: &Item) -> Vec<Item> {
+    let item_len = match item {
+        Item::Comb(_) => 1,
+        Item::Group(expr) => expr.items.len(),
+    };
+    let mut items = Vec::with_capacity(item_len * 2);
+    append_expanded(item, &mut items);
+    append_expanded(item, &mut items);
+    items
 }
 
 #[inline]
@@ -284,10 +363,50 @@ fn push_item_string(item: &Item, out: &mut String) {
 }
 
 #[inline]
+fn push_item_string_limited(item: &Item, out: &mut String, limit: usize) -> bool {
+    match item {
+        Item::Comb(c) => {
+            if out.len() == limit {
+                return false;
+            }
+            out.push(*c as char);
+            true
+        }
+        Item::Group(expr) => {
+            if out.len() == limit {
+                return false;
+            }
+            out.push('(');
+            for child in &expr.items {
+                if !push_item_string_limited(child, out, limit) {
+                    return false;
+                }
+            }
+            if out.len() == limit {
+                return false;
+            }
+            out.push(')');
+            true
+        }
+    }
+}
+
+#[inline]
 fn stringify(expr: &Expr) -> String {
     let mut out = String::with_capacity(expr.flat_len + expr.items.len());
     for item in &expr.items {
         push_item_string(item, &mut out);
+    }
+    out
+}
+
+#[inline]
+fn stringify_prefix(expr: &Expr, limit: usize) -> String {
+    let mut out = String::with_capacity(limit.min(expr.flat_len + expr.items.len()));
+    for item in &expr.items {
+        if !push_item_string_limited(item, &mut out, limit) {
+            break;
+        }
     }
     out
 }
@@ -304,24 +423,23 @@ fn apply_rule(expr: &mut Expr, pos: usize, c: u8) -> bool {
     match c {
         b'R' if rest_len >= 1 => {
             let x = expr.items[pos + 1].clone();
-            expr.replace_consumed(pos, 2, [x.clone(), x]);
+            expr.items[pos] = x.clone();
+            expr.items[pos + 1] = x;
+            expr.refresh();
             true
         }
         b'E' if rest_len >= 2 => {
-            expr.replace_consumed(pos, 2, std::iter::empty::<Item>());
+            expr.items.drain(pos..pos + 2);
+            expr.refresh();
             true
         }
         b'S' if rest_len >= 2 => {
             let x = expr.items[pos + 1].clone();
             let y = expr.items[pos + 2].clone();
 
-            let mut xx_items = expand_item(&x);
-            xx_items.extend(expand_item(&x));
-            let xx = group_from_items(xx_items);
+            let xx = group_from_items(expanded_twice(&x));
 
-            let mut yy_items = expand_item(&y);
-            yy_items.extend(expand_item(&y));
-            let yy = group_from_items(yy_items);
+            let yy = group_from_items(expanded_twice(&y));
 
             expr.replace_consumed(pos, 3, [xx.clone(), yy, xx]);
             true
@@ -330,7 +448,12 @@ fn apply_rule(expr: &mut Expr, pos: usize, c: u8) -> bool {
             let x = expr.items[pos + 1].clone();
             let y = expr.items[pos + 2].clone();
 
-            let mut yx_items = expand_item(&y);
+            let y_len = match &y {
+                Item::Comb(_) => 1,
+                Item::Group(inner) => inner.items.len(),
+            };
+            let mut yx_items = Vec::with_capacity(y_len + 1);
+            append_expanded(&y, &mut yx_items);
             yx_items.push(x.clone());
             let yx = group_from_items(yx_items);
 
@@ -342,7 +465,12 @@ fn apply_rule(expr: &mut Expr, pos: usize, c: u8) -> bool {
             let y = expr.items[pos + 2].clone();
             let z = expr.items[pos + 3].clone();
 
-            let mut xz_items = expand_item(&x);
+            let x_len = match &x {
+                Item::Comb(_) => 1,
+                Item::Group(inner) => inner.items.len(),
+            };
+            let mut xz_items = Vec::with_capacity(x_len + 1);
+            append_expanded(&x, &mut xz_items);
             xz_items.push(z);
             let xz = group_from_items(xz_items);
 
@@ -354,8 +482,13 @@ fn apply_rule(expr: &mut Expr, pos: usize, c: u8) -> bool {
             let y = expr.items[pos + 2].clone();
             let z = expr.items[pos + 3].clone();
 
-            let mut yyz_items = expand_item(&y);
-            yyz_items.extend(expand_item(&y));
+            let y_len = match &y {
+                Item::Comb(_) => 1,
+                Item::Group(inner) => inner.items.len(),
+            };
+            let mut yyz_items = Vec::with_capacity(y_len * 2 + 1);
+            append_expanded(&y, &mut yyz_items);
+            append_expanded(&y, &mut yyz_items);
             yyz_items.push(z);
             let yyz = group_from_items(yyz_items);
 
@@ -364,38 +497,52 @@ fn apply_rule(expr: &mut Expr, pos: usize, c: u8) -> bool {
         }
         b'T' if rest_len >= 2 => {
             let a = expr.items[pos + 1].clone();
-            let mut items = std::mem::take(&mut expr.items);
-            let tail = items.split_off(pos + 2);
-            items.truncate(pos);
-            items.extend(tail);
-            items.push(a);
-            expr.items = items;
+            expr.items.drain(pos..pos + 2);
+            expr.items.push(a);
             expr.refresh();
             true
         }
         b'C' if rest_len >= 1 => {
             let a = expr.items[pos + 1].clone();
-            let mut items = std::mem::take(&mut expr.items);
-            let tail = items.split_off(pos + 1);
-            items.truncate(pos);
-            items.extend(tail);
-            items.push(a);
-            expr.items = items;
+            expr.items.remove(pos);
+            expr.items.push(a);
             expr.refresh();
             true
         }
         b'N' if rest_len >= 1 => {
-            let mut items = std::mem::take(&mut expr.items);
-            let mut tail = items.split_off(pos + 1);
-            items.truncate(pos);
-            tail.reverse();
-            items.extend(tail);
-            expr.items = items;
+            expr.items.remove(pos);
+            expr.items[pos..].reverse();
             expr.refresh();
             true
         }
         _ => false,
     }
+}
+
+#[inline]
+fn has_rule_at(expr: &Expr, pos: usize, c: u8) -> bool {
+    let rest_len = expr.items.len() - pos - 1;
+    match c {
+        b'R' | b'C' | b'N' => rest_len >= 1,
+        b'E' | b'S' | b'O' | b'T' => rest_len >= 2,
+        b'I' | b'D' => rest_len >= 3,
+        _ => false,
+    }
+}
+
+fn has_redex(expr: &Expr) -> bool {
+    for (i, item) in expr.items.iter().enumerate() {
+        if let Item::Comb(c) = item {
+            if has_rule_at(expr, i, *c) {
+                return true;
+            }
+        }
+    }
+
+    expr.items.iter().any(|item| match item {
+        Item::Comb(_) => false,
+        Item::Group(inner) => has_redex(inner),
+    })
 }
 
 fn reduce_once(expr: &mut Expr) -> bool {
@@ -428,6 +575,11 @@ fn reduce_once(expr: &mut Expr) -> bool {
         match &mut expr.items[i] {
             Item::Comb(_) => {}
             Item::Group(inner) => {
+                if Arc::strong_count(inner) != 1 && !has_redex(inner) {
+                    i += 1;
+                    continue;
+                }
+                let inner = Arc::make_mut(inner);
                 if reduce_once(inner) {
                     reduced = true;
                     if inner.items.len() == 1 {
@@ -452,14 +604,12 @@ fn reduce_once(expr: &mut Expr) -> bool {
 }
 
 fn render_truncated(expr: &Expr) -> String {
-    let rendered = stringify(expr);
-    let end = rendered.len().min(100);
-    format!("{}... (truncated)", &rendered[..end])
+    format!("{}... (truncated)", stringify_prefix(expr, TRUNCATED_RENDER_LEN))
 }
 
 fn reduce_full(s: &str, max_steps: usize, max_len: usize) -> ReduceResult {
     let mut expr = parse(s);
-    let mut seen = FxHashSet::default();
+    let mut seen = SeenFingerprints::new();
     seen.insert(expr.fingerprint());
 
     let mut step = 0usize;
@@ -490,7 +640,7 @@ fn reduce_full(s: &str, max_steps: usize, max_len: usize) -> ReduceResult {
 
 fn reduce_search_candidate(index: usize, length: usize, max_steps: usize, max_len: usize) -> CandidateResult {
     let mut expr = Expr::from_index(index, length);
-    let mut seen = FxHashSet::default();
+    let mut seen = SeenFingerprints::new();
     seen.insert(expr.fingerprint());
 
     let mut step = 0usize;
@@ -555,7 +705,7 @@ fn index_to_string(mut index: usize, length: usize) -> String {
 fn make_search_hit(index: usize, length: usize, result: CandidateResult) -> SearchHit {
     SearchHit {
         expr: index_to_string(index, length),
-        out: stringify(&result.final_expr),
+        out: stringify_prefix(&result.final_expr, SEARCH_PREVIEW_LEN + 1),
         step: result.step,
         status: result.status,
     }
@@ -673,7 +823,7 @@ fn main() {
 
                 let start = Instant::now();
                 let mut expr = parse(input);
-                let mut seen = FxHashSet::default();
+                let mut seen = SeenFingerprints::new();
                 seen.insert(expr.fingerprint());
 
                 let mut step = 0usize;
