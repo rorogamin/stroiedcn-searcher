@@ -8,7 +8,7 @@ use std::io::{self, Write};
 use std::time::Instant;
 
 const ALPHABET: [u8; 9] = *b"STROIEDCN";
-const MAX_EXPR_LEN: usize = 50_000;
+const DEFAULT_MAX_LEN: usize = 50_000;
 const HASH1_SEED: u64 = 0x9E37_79B1_85EB_CA87;
 const HASH2_SEED: u64 = 0xC2B2_AE3D_27D4_EB4F;
 const HASH1_MUL: u64 = 0x94D0_49BB_1331_11EB;
@@ -457,7 +457,7 @@ fn render_truncated(expr: &Expr) -> String {
     format!("{}... (truncated)", &rendered[..end])
 }
 
-fn reduce_full(s: &str, max_steps: usize) -> ReduceResult {
+fn reduce_full(s: &str, max_steps: usize, max_len: usize) -> ReduceResult {
     let mut expr = parse(s);
     let mut seen = FxHashSet::default();
     seen.insert(expr.fingerprint());
@@ -475,7 +475,7 @@ fn reduce_full(s: &str, max_steps: usize) -> ReduceResult {
             return ReduceResult { result: stringify(&expr), steps: step, status: "fixed_point" };
         }
 
-        if expr_len(&expr) > MAX_EXPR_LEN {
+        if expr_len(&expr) > max_len {
             return ReduceResult { result: render_truncated(&expr), steps: step, status: "limit_reached" };
         }
 
@@ -488,7 +488,7 @@ fn reduce_full(s: &str, max_steps: usize) -> ReduceResult {
     ReduceResult { result: stringify(&expr), steps: step, status: "limit_reached" }
 }
 
-fn reduce_search_candidate(index: usize, length: usize, max_steps: usize) -> CandidateResult {
+fn reduce_search_candidate(index: usize, length: usize, max_steps: usize, max_len: usize) -> CandidateResult {
     let mut expr = Expr::from_index(index, length);
     let mut seen = FxHashSet::default();
     seen.insert(expr.fingerprint());
@@ -528,7 +528,7 @@ fn reduce_search_candidate(index: usize, length: usize, max_steps: usize) -> Can
             return CandidateResult { final_expr: expr, step, status: "fixed_point" };
         }
 
-        if expr.flat_len > MAX_EXPR_LEN {
+        if expr.flat_len > max_len {
             return CandidateResult { final_expr: expr, step, status: "limit_reached" };
         }
 
@@ -575,23 +575,31 @@ enum Commands {
         file: String,
         #[arg(long, default_value_t = 500)]
         max_steps: usize,
+        #[arg(long, default_value_t = DEFAULT_MAX_LEN)]
+        max_len: usize,
     },
     /// Evaluate a single expression
     Eval {
         expression: Vec<String>,
         #[arg(long, default_value_t = 500)]
         max_steps: usize,
+        #[arg(long, default_value_t = DEFAULT_MAX_LEN)]
+        max_len: usize,
     },
     /// Interactive REPL
     Repl {
         #[arg(long, default_value_t = 500)]
         max_steps: usize,
+        #[arg(long, default_value_t = DEFAULT_MAX_LEN)]
+        max_len: usize,
     },
     /// Enumerate all strings of given length
     Search {
         length: usize,
         #[arg(long, default_value_t = 50)]
         max_steps: usize,
+        #[arg(long, default_value_t = DEFAULT_MAX_LEN)]
+        max_len: usize,
         #[arg(long)]
         filter: Option<String>,
         #[arg(long, alias = "set-LBlength", default_value_t = 10)]
@@ -607,20 +615,20 @@ fn main() {
     let cli = Cli::parse();
 
     match &cli.command {
-        Commands::Eval { expression, max_steps } => {
+        Commands::Eval { expression, max_steps, max_len } => {
             let expr = expression.join("");
             println!("======================================================");
             println!("  STROIED-CN Interpreter (Rust)");
             println!("======================================================");
             println!("  Expression: {}\n", expr);
             let start = Instant::now();
-            let res = reduce_full(&expr, *max_steps);
+            let res = reduce_full(&expr, *max_steps, *max_len);
             let elapsed = start.elapsed();
             println!("  Result: {}", res.result);
             println!("  Steps: {}, Status: {}", res.steps, res.status);
             println!("  Time: {:.4}s\n", elapsed.as_secs_f64());
         }
-        Commands::Run { file, max_steps } => {
+        Commands::Run { file, max_steps, max_len } => {
             let content = fs::read_to_string(file).expect("Failed to read file");
             println!("======================================================");
             println!("  STROIED-CN Interpreter (Rust)");
@@ -632,13 +640,13 @@ fn main() {
                 }
                 println!("> Line {}: {}", i + 1, line);
                 let start = Instant::now();
-                let res = reduce_full(line, *max_steps);
+                let res = reduce_full(line, *max_steps, *max_len);
                 let elapsed = start.elapsed();
                 println!("  Result: {}", res.result);
                 println!("  Steps: {} | Time: {:.4}s\n", res.steps, elapsed.as_secs_f64());
             }
         }
-        Commands::Repl { max_steps } => {
+        Commands::Repl { max_steps, max_len } => {
             println!("======================================================");
             println!("  STROIED-CN REPL (Rust)");
             println!("======================================================");
@@ -685,7 +693,7 @@ fn main() {
                         break;
                     }
 
-                    if expr_len(&expr) > MAX_EXPR_LEN {
+                    if expr_len(&expr) > *max_len {
                         status = "limit_reached";
                         break;
                     }
@@ -702,7 +710,7 @@ fn main() {
                 println!("  Steps: {}, Status: {}, Time: {:.4}s\n", step, status, elapsed.as_secs_f64());
             }
         }
-        Commands::Search { length, max_steps, filter, limit, threads } => {
+        Commands::Search { length, max_steps, max_len, filter, limit, threads } => {
             println!("======================================================");
             println!("  STROIED-CN Search (length={})", length);
             println!("======================================================");
@@ -720,7 +728,7 @@ fn main() {
                     .fold(
                         || SearchAccumulator::new(keep_limit),
                         |mut acc, index| {
-                            let result = reduce_search_candidate(index, *length, *max_steps);
+                            let result = reduce_search_candidate(index, *length, *max_steps, *max_len);
                             let keep = match filter {
                                 Some(wanted) => wanted == result.status,
                                 None => true,
@@ -790,7 +798,7 @@ fn main() {
 
             for (expr, limit) in tests {
                 let start = Instant::now();
-                let res = reduce_full(expr, limit);
+                let res = reduce_full(expr, limit, DEFAULT_MAX_LEN);
                 let elapsed = start.elapsed();
                 println!(
                     "{:15} ms={:4}, steps={:4}, status={:14}, len={:8}, time={:.4}s",
