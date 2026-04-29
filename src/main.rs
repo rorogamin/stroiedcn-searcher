@@ -68,6 +68,13 @@ struct CandidateResult {
     status: &'static str,
 }
 
+#[derive(Clone)]
+struct SMatch {
+    expr: String,
+    steps: usize,
+    status: &'static str,
+}
+
 struct SearchAccumulator {
     total_hits: usize,
     limit: usize,
@@ -426,8 +433,8 @@ fn apply_rule(expr: &mut Expr, pos: usize, c: u8, step_budget: usize) -> usize {
             1
         }
         b'E' if rest_len >= 2 => {
-            expr.items.drain(pos..pos + 2);
-            expr.refresh();
+            let x = expr.items[pos + 1].clone();
+            expr.replace_consumed(pos, 3, [x]);
             1
         }
         b'S' if rest_len >= 2 => {
@@ -733,6 +740,131 @@ fn make_search_hit(index: usize, length: usize, result: CandidateResult) -> Sear
     }
 }
 
+fn find_s_matches_in_domain(
+    length: usize,
+    max_steps: usize,
+    max_len: usize,
+    threads: Option<usize>,
+) -> Vec<SMatch> {
+    let target = "XZ(YZ)";
+    let total = ALPHABET.len().pow(length as u32);
+
+    let job = || {
+        (0..total)
+            .into_par_iter()
+            .filter_map(|index| {
+                let expr = index_to_string(index, length);
+                let lhs = format!("{}XYZ", expr);
+                let res = reduce_full(&lhs, max_steps, max_len);
+
+                if res.status == "limit_reached" || res.status == "cycle" {
+                    return None;
+                }
+
+                if res.result == target {
+                    return Some(SMatch {
+                        expr,
+                        steps: res.steps,
+                        status: res.status,
+                    });
+                }
+
+                None
+            })
+            .collect::<Vec<SMatch>>()
+    };
+
+    let mut matches = if let Some(t) = threads {
+        rayon::ThreadPoolBuilder::new()
+            .num_threads(t)
+            .build()
+            .unwrap()
+            .install(job)
+    } else {
+        job()
+    };
+
+    matches.sort_by(|a, b| a.steps.cmp(&b.steps).then_with(|| a.expr.cmp(&b.expr)));
+    matches
+}
+
+#[inline]
+fn fill_placeholders(template: &str, candidate: &str) -> Option<String> {
+    if !template.bytes().any(|b| b == b'.' || b == b'?') {
+        return None;
+    }
+
+    let mut out = String::with_capacity(template.len() + candidate.len());
+    for ch in template.chars() {
+        if ch == '.' || ch == '?' {
+            out.push_str(candidate);
+        } else if !ch.is_whitespace() {
+            out.push(ch);
+        }
+    }
+    Some(out)
+}
+
+#[inline]
+fn normalize_equation_side(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    for ch in s.chars() {
+        if ch.is_whitespace() {
+            continue;
+        }
+        out.push(ch.to_ascii_uppercase());
+    }
+    out
+}
+
+fn find_equation_matches_in_domain(
+    lhs_template: &str,
+    rhs_target: &str,
+    length: usize,
+    max_steps: usize,
+    max_len: usize,
+    threads: Option<usize>,
+) -> Vec<SMatch> {
+    let total = ALPHABET.len().pow(length as u32);
+
+    let job = || {
+        (0..total)
+            .into_par_iter()
+            .filter_map(|index| {
+                let expr = index_to_string(index, length);
+                let lhs = fill_placeholders(lhs_template, &expr)?;
+                let res = reduce_full(&lhs, max_steps, max_len);
+
+                if res.status == "limit_reached" || res.status == "cycle" {
+                    return None;
+                }
+                if res.result != rhs_target {
+                    return None;
+                }
+
+                Some(SMatch {
+                    expr,
+                    steps: res.steps,
+                    status: res.status,
+                })
+            })
+            .collect::<Vec<SMatch>>()
+    };
+
+    let mut matches = if let Some(t) = threads {
+        rayon::ThreadPoolBuilder::new()
+            .num_threads(t)
+            .build()
+            .unwrap()
+            .install(job)
+    } else {
+        job()
+    };
+
+    matches.sort_by(|a, b| a.steps.cmp(&b.steps).then_with(|| a.expr.cmp(&b.expr)));
+    matches
+}
+
 #[derive(Parser)]
 #[command(name = "stoicn", about = "STROIED-CN Interpreter & Toolkit (Rust engine)", version)]
 struct Cli {
@@ -781,6 +913,21 @@ enum Commands {
     },
     /// Run benchmark tests
     Bench,
+    /// Search ST(1..=domain) for combinator strings that behave like SKI S.
+    /// Examples:
+    ///   stoicn find S 5
+    ///   stoicn find .XYZ = XZ(YZ) 5
+    Find {
+        query: Vec<String>,
+        #[arg(long, default_value_t = 300)]
+        max_steps: usize,
+        #[arg(long, default_value_t = DEFAULT_MAX_LEN)]
+        max_len: usize,
+        #[arg(long)]
+        threads: Option<usize>,
+        #[arg(long, default_value_t = 5)]
+        show: usize,
+    },
 }
 
 fn main() {
@@ -984,6 +1131,104 @@ fn main() {
                     res.result.len(),
                     elapsed.as_secs_f64()
                 );
+            }
+        }
+        Commands::Find { query, max_steps, max_len, threads, show } => {
+            if query.len() < 2 {
+                eprintln!("Usage: stoicn find S <domain> OR stoicn find <lhs> = <rhs> <domain>");
+                return;
+            }
+
+            let domain = match query.last().and_then(|s| s.parse::<usize>().ok()) {
+                Some(d) => d,
+                None => {
+                    eprintln!("Last argument must be a domain number.");
+                    return;
+                }
+            };
+            if domain == 0 {
+                eprintln!("Domain must be >= 1.");
+                return;
+            }
+
+            let parts = &query[..query.len() - 1];
+            let mut mode_s = false;
+            let mut lhs_template = String::new();
+            let mut rhs_target = String::new();
+            let mut auto_xyz = false;
+
+            if parts.len() == 1 && parts[0].eq_ignore_ascii_case("S") {
+                mode_s = true;
+            } else {
+                let Some(eq_pos) = parts.iter().position(|p| p == "=") else {
+                    eprintln!("Equation mode requires '='. Example: stoicn find .XYZ = XZ(YZ) 5");
+                    return;
+                };
+                if eq_pos == 0 || eq_pos + 1 >= parts.len() {
+                    eprintln!("Equation must include both LHS and RHS.");
+                    return;
+                }
+                lhs_template = normalize_equation_side(&parts[..eq_pos].join(""));
+                rhs_target = normalize_equation_side(&parts[eq_pos + 1..].join(""));
+                if !lhs_template.contains('.') && !lhs_template.contains('?') {
+                    eprintln!("LHS must contain '.' or '?' placeholder(s).");
+                    return;
+                }
+
+                let has_vars = lhs_template.contains('X') || lhs_template.contains('Y') || lhs_template.contains('Z');
+                if !has_vars {
+                    lhs_template.push_str("XYZ");
+                    auto_xyz = true;
+                }
+            }
+
+            println!("======================================================");
+            println!("  STROIED-CN Find S (domains 1..={})", domain);
+            println!("======================================================");
+            if mode_s {
+                println!("  Equation checked: ?XYZ => XZ(YZ)");
+            } else {
+                println!("  Equation checked: {} => {}", lhs_template, rhs_target);
+                if auto_xyz {
+                    println!("  Note: no XYZ variables in LHS; treated as {}.", lhs_template);
+                }
+            }
+
+            for d in 1..=domain {
+                let start = Instant::now();
+                let matches = if mode_s {
+                    find_s_matches_in_domain(d, *max_steps, *max_len, *threads)
+                } else {
+                    find_equation_matches_in_domain(
+                        &lhs_template,
+                        &rhs_target,
+                        d,
+                        *max_steps,
+                        *max_len,
+                        *threads,
+                    )
+                };
+                let elapsed = start.elapsed();
+
+                if matches.is_empty() {
+                    println!(
+                        "  ST({:2}): no S-like combinator found in {:.4}s",
+                        d,
+                        elapsed.as_secs_f64()
+                    );
+                    continue;
+                }
+
+                println!(
+                    "  ST({:2}): found {} match(es) in {:.4}s",
+                    d,
+                    matches.len(),
+                    elapsed.as_secs_f64()
+                );
+
+                for m in matches.iter().take(*show) {
+                    println!("    {:12} steps={:4} status={}", m.expr, m.steps, m.status);
+                }
             }
         }
     }
