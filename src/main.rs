@@ -3,18 +3,34 @@
 use clap::{Parser, Subcommand};
 use rayon::prelude::*;
 use rustc_hash::FxHashSet;
+use std::collections::hash_map::RandomState;
 use std::fs;
+use std::hash::{BuildHasher, Hasher};
 use std::io::{self, Write};
-use std::sync::Arc;
+use std::sync::{Arc, OnceLock};
 use std::time::Instant;
 
 const ALPHABET: [u8; 9] = *b"STROIEDCN";
-const DEFAULT_MAX_LEN: usize = 50_000;
-const HASH1_SEED: u64 = 0x9E37_79B1_85EB_CA87;
-const HASH2_SEED: u64 = 0xC2B2_AE3D_27D4_EB4F;
+const DEFAULT_MAX_LEN: usize = 1_000_000;
 const HASH1_MUL: u64 = 0x94D0_49BB_1331_11EB;
 const HASH2_MUL: u64 = 0x369D_EA0F_31A5_3F85;
-const INLINE_SEEN_CAP: usize = 64;
+
+static HASH_SEEDS: OnceLock<(u64, u64)> = OnceLock::new();
+
+#[inline(always)]
+fn hash_seeds() -> (u64, u64) {
+    *HASH_SEEDS.get_or_init(|| {
+        let rs = RandomState::new();
+        let mut h1 = rs.build_hasher();
+        h1.write_u64(0x9E37_79B1_85EB_CA87);
+        let seed1 = h1.finish();
+        let mut h2 = rs.build_hasher();
+        h2.write_u64(0xC2B2_AE3D_27D4_EB4F);
+        let seed2 = h2.finish();
+        (seed1, seed2)
+    })
+}
+const INLINE_SEEN_CAP: usize = 128;
 const TRUNCATED_RENDER_LEN: usize = 100;
 const SEARCH_PREVIEW_LEN: usize = 40;
 const STABLE_CYCLE_CHECK_STEPS: usize = 4;
@@ -39,7 +55,7 @@ struct Fingerprint {
     lo: u64,
 }
 
-const EMPTY_FINGERPRINT: Fingerprint = Fingerprint { hi: 0, lo: 0 };
+const EMPTY_FINGERPRINT: Fingerprint = Fingerprint { hi: 0xDEAD_BEEF_CAFE_BABE, lo: 0xFEED_FACE_0BAD_F00D };
 
 struct SeenFingerprints {
     inline: [Fingerprint; INLINE_SEEN_CAP],
@@ -136,8 +152,9 @@ impl Expr {
     #[inline]
     fn refresh(&mut self) {
         let mut flat_len = 0usize;
-        let mut fp1 = HASH1_SEED ^ (self.items.len() as u64);
-        let mut fp2 = HASH2_SEED ^ ((self.items.len() as u64).rotate_left(17));
+        let (seed1, seed2) = hash_seeds();
+        let mut fp1 = seed1 ^ (self.items.len() as u64);
+        let mut fp2 = seed2 ^ ((self.items.len() as u64).rotate_left(17));
 
         for item in &self.items {
             flat_len += item.flat_len();
@@ -176,7 +193,22 @@ impl SeenFingerprints {
             return spill.insert(fp);
         }
 
-        if self.len < INLINE_SEEN_CAP {
+        if fp == EMPTY_FINGERPRINT {
+            // Collision with sentinel — go straight to spill set to avoid confusion
+            let mut spill = FxHashSet::default();
+            spill.reserve(INLINE_SEEN_CAP * 2);
+            for existing in &self.inline {
+                if *existing != EMPTY_FINGERPRINT {
+                    spill.insert(*existing);
+                }
+            }
+            let inserted = spill.insert(fp);
+            self.spill = Some(spill);
+            return inserted;
+        }
+
+        // Load factor ~75% to keep probing fast
+        if self.len < (INLINE_SEEN_CAP * 3 / 4) {
             let mut idx = fingerprint_slot(fp);
             loop {
                 if self.inline[idx] == EMPTY_FINGERPRINT {
@@ -442,7 +474,6 @@ fn apply_rule(expr: &mut Expr, pos: usize, c: u8, step_budget: usize) -> usize {
             let y = expr.items[pos + 2].clone();
 
             let xx = group_from_items(expanded_twice(&x));
-
             let yy = group_from_items(expanded_twice(&y));
 
             expr.replace_consumed(pos, 3, [xx.clone(), yy, xx]);
@@ -507,9 +538,15 @@ fn apply_rule(expr: &mut Expr, pos: usize, c: u8, step_budget: usize) -> usize {
             1
         }
         b'C' if rest_len >= 1 => {
+            // Macro fusion: CR x ...rest
+            // Step 1 (C fires): R x ...rest R   (C clones R, puts copy at end)
+            // Step 2 (R fires): x x ...rest R   (R duplicates x)
             if step_budget >= 2 && rest_len >= 2 && matches!(expr.items[pos + 1], Item::Comb(b'R')) {
                 let x = expr.items[pos + 2].clone();
-                expr.items.splice(pos..pos + 3, [x.clone(), x, Item::Comb(b'R')]);
+                // Remove C, R, x  and replace with x, x
+                expr.items.splice(pos..pos + 3, [x.clone(), x]);
+                // R goes to the END of the entire expression
+                expr.items.push(Item::Comb(b'R'));
                 expr.refresh();
                 return 2;
             }
