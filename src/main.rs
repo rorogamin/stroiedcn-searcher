@@ -55,7 +55,10 @@ struct Fingerprint {
     lo: u64,
 }
 
-const EMPTY_FINGERPRINT: Fingerprint = Fingerprint { hi: 0xDEAD_BEEF_CAFE_BABE, lo: 0xFEED_FACE_0BAD_F00D };
+const EMPTY_FINGERPRINT: Fingerprint = Fingerprint {
+    hi: 0xDEAD_BEEF_CAFE_BABE,
+    lo: 0xFEED_FACE_0BAD_F00D,
+};
 
 struct SeenFingerprints {
     inline: [Fingerprint; INLINE_SEEN_CAP],
@@ -126,7 +129,12 @@ impl Item {
 impl Expr {
     #[inline]
     fn new(items: Vec<Item>) -> Self {
-        let mut expr = Self { items, flat_len: 0, fp1: 0, fp2: 0 };
+        let mut expr = Self {
+            items,
+            flat_len: 0,
+            fp1: 0,
+            fp2: 0,
+        };
         expr.refresh();
         expr
     }
@@ -247,7 +255,11 @@ impl SearchAccumulator {
         Self {
             total_hits: 0,
             limit,
-            items: if limit == 0 { Vec::new() } else { Vec::with_capacity(limit) },
+            items: if limit == 0 {
+                Vec::new()
+            } else {
+                Vec::with_capacity(limit)
+            },
         }
     }
 
@@ -318,15 +330,16 @@ impl SearchAccumulator {
 
 #[inline(always)]
 fn mix_hash(hash: u64, value: u64, mul: u64) -> u64 {
-    (hash ^ value.wrapping_mul(mul)).rotate_left(27).wrapping_mul(mul)
+    (hash ^ value.wrapping_mul(mul))
+        .rotate_left(27)
+        .wrapping_mul(mul)
 }
 
 #[inline]
 fn group_from_items(mut items: Vec<Item>) -> Item {
-    if items.len() == 1 {
-        items.pop().unwrap()
-    } else {
-        Item::Group(Arc::new(Expr::new(items)))
+    match items.len() {
+        1 => items.remove(0),
+        _ => Item::Group(Arc::new(Expr::new(items))),
     }
 }
 
@@ -366,22 +379,31 @@ fn parse(s: &str) -> Expr {
         match b {
             b'(' => stack.push(Vec::new()),
             b')' => {
-                if stack.len() > 1 {
-                    let items = stack.pop().unwrap();
-                    stack.last_mut().unwrap().push(group_from_items(items));
+                if stack.len() > 1
+                    && let Some(items) = stack.pop()
+                    && let Some(parent) = stack.last_mut()
+                {
+                    parent.push(group_from_items(items));
                 }
             }
             b if b.is_ascii_whitespace() => {}
-            _ => stack.last_mut().unwrap().push(Item::Comb(b)),
+            _ => {
+                if let Some(parent) = stack.last_mut() {
+                    parent.push(Item::Comb(b));
+                }
+            }
         }
     }
 
     while stack.len() > 1 {
-        let items = stack.pop().unwrap();
-        stack.last_mut().unwrap().push(group_from_items(items));
+        if let Some(items) = stack.pop()
+            && let Some(parent) = stack.last_mut()
+        {
+            parent.push(group_from_items(items));
+        }
     }
 
-    Expr::new(stack.pop().unwrap())
+    Expr::new(stack.pop().unwrap_or_default())
 }
 
 #[inline]
@@ -541,7 +563,8 @@ fn apply_rule(expr: &mut Expr, pos: usize, c: u8, step_budget: usize) -> usize {
             // Macro fusion: CR x ...rest
             // Step 1 (C fires): R x ...rest R   (C clones R, puts copy at end)
             // Step 2 (R fires): x x ...rest R   (R duplicates x)
-            if step_budget >= 2 && rest_len >= 2 && matches!(expr.items[pos + 1], Item::Comb(b'R')) {
+            if step_budget >= 2 && rest_len >= 2 && matches!(expr.items[pos + 1], Item::Comb(b'R'))
+            {
                 let x = expr.items[pos + 2].clone();
                 // Remove C, R, x  and replace with x, x
                 expr.items.splice(pos..pos + 3, [x.clone(), x]);
@@ -579,10 +602,10 @@ fn has_rule_at(expr: &Expr, pos: usize, c: u8) -> bool {
 
 fn has_redex(expr: &Expr) -> bool {
     for (i, item) in expr.items.iter().enumerate() {
-        if let Item::Comb(c) = item {
-            if has_rule_at(expr, i, *c) {
-                return true;
-            }
+        if let Item::Comb(c) = item
+            && has_rule_at(expr, i, *c)
+        {
+            return true;
         }
     }
 
@@ -648,7 +671,10 @@ fn reduce_once(expr: &mut Expr, step_budget: usize) -> usize {
 }
 
 fn render_truncated(expr: &Expr) -> String {
-    format!("{}... (truncated)", stringify_prefix(expr, TRUNCATED_RENDER_LEN))
+    format!(
+        "{}... (truncated)",
+        stringify_prefix(expr, TRUNCATED_RENDER_LEN)
+    )
 }
 
 #[inline]
@@ -680,28 +706,54 @@ fn reduce_full(s: &str, max_steps: usize, max_len: usize) -> ReduceResult {
 
         let step_delta = reduce_once(&mut expr, max_steps - step);
         if step_delta == 0 {
-            return ReduceResult { result: stringify(&expr), steps: step, status: "normal" };
+            return ReduceResult {
+                result: stringify(&expr),
+                steps: step,
+                status: "normal",
+            };
         }
 
         let next = expr.fingerprint();
         if next == prev {
-            return ReduceResult { result: stringify(&expr), steps: step, status: "fixed_point" };
+            return ReduceResult {
+                result: stringify(&expr),
+                steps: step,
+                status: "fixed_point",
+            };
         }
 
         if expr_len(&expr) > max_len {
-            return ReduceResult { result: render_truncated(&expr), steps: step, status: "limit_reached" };
+            return ReduceResult {
+                result: render_truncated(&expr),
+                steps: step,
+                status: "limit_reached",
+            };
         }
 
         step = (step + step_delta).min(max_steps);
-        if should_checkpoint_cycle(prev_len, expr.flat_len, &mut stable_steps) && !seen.insert(next) {
-            return ReduceResult { result: stringify(&expr), steps: step, status: "cycle" };
+        if should_checkpoint_cycle(prev_len, expr.flat_len, &mut stable_steps) && !seen.insert(next)
+        {
+            return ReduceResult {
+                result: stringify(&expr),
+                steps: step,
+                status: "cycle",
+            };
         }
     }
 
-    ReduceResult { result: stringify(&expr), steps: step, status: "limit_reached" }
+    ReduceResult {
+        result: stringify(&expr),
+        steps: step,
+        status: "limit_reached",
+    }
 }
 
-fn reduce_search_candidate(index: usize, length: usize, max_steps: usize, max_len: usize) -> CandidateResult {
+fn reduce_search_candidate(
+    index: usize,
+    length: usize,
+    max_steps: usize,
+    max_len: usize,
+) -> CandidateResult {
     let mut expr = Expr::from_index(index, length);
     let mut seen = SeenFingerprints::new();
     seen.insert(expr.fingerprint());
@@ -717,7 +769,7 @@ fn reduce_search_candidate(index: usize, length: usize, max_steps: usize, max_le
             min_len_this_epoch = expr.flat_len;
         }
 
-        if step > 0 && step % 100 == 0 {
+        if step > 0 && step.is_multiple_of(100) {
             epochs[epoch_count % 3] = min_len_this_epoch;
             epoch_count += 1;
             min_len_this_epoch = usize::MAX;
@@ -727,7 +779,11 @@ fn reduce_search_candidate(index: usize, length: usize, max_steps: usize, max_le
                 let b = epochs[(epoch_count - 2) % 3];
                 let c = epochs[(epoch_count - 1) % 3];
                 if a < b && b < c {
-                    return CandidateResult { final_expr: expr, step, status: "divergent" };
+                    return CandidateResult {
+                        final_expr: expr,
+                        step,
+                        status: "divergent",
+                    };
                 }
             }
         }
@@ -736,25 +792,46 @@ fn reduce_search_candidate(index: usize, length: usize, max_steps: usize, max_le
         let prev_len = expr.flat_len;
         let step_delta = reduce_once(&mut expr, max_steps - step);
         if step_delta == 0 {
-            return CandidateResult { final_expr: expr, step, status: "normal" };
+            return CandidateResult {
+                final_expr: expr,
+                step,
+                status: "normal",
+            };
         }
 
         let next = expr.fingerprint();
         if next == prev {
-            return CandidateResult { final_expr: expr, step, status: "fixed_point" };
+            return CandidateResult {
+                final_expr: expr,
+                step,
+                status: "fixed_point",
+            };
         }
 
         if expr.flat_len > max_len {
-            return CandidateResult { final_expr: expr, step, status: "limit_reached" };
+            return CandidateResult {
+                final_expr: expr,
+                step,
+                status: "limit_reached",
+            };
         }
 
         step = (step + step_delta).min(max_steps);
-        if should_checkpoint_cycle(prev_len, expr.flat_len, &mut stable_steps) && !seen.insert(next) {
-            return CandidateResult { final_expr: expr, step, status: "cycle" };
+        if should_checkpoint_cycle(prev_len, expr.flat_len, &mut stable_steps) && !seen.insert(next)
+        {
+            return CandidateResult {
+                final_expr: expr,
+                step,
+                status: "cycle",
+            };
         }
     }
 
-    CandidateResult { final_expr: expr, step, status: "limit_reached" }
+    CandidateResult {
+        final_expr: expr,
+        step,
+        status: "limit_reached",
+    }
 }
 
 #[inline]
@@ -764,7 +841,30 @@ fn index_to_string(mut index: usize, length: usize) -> String {
         *slot = ALPHABET[index % ALPHABET.len()];
         index /= ALPHABET.len();
     }
-    String::from_utf8(bytes).unwrap()
+    match String::from_utf8(bytes) {
+        Ok(s) => s,
+        Err(err) => err
+            .into_bytes()
+            .into_iter()
+            .map(char::from)
+            .collect::<String>(),
+    }
+}
+
+fn install_thread_pool<T, F>(threads: usize, job: F) -> T
+where
+    T: Send,
+    F: FnOnce() -> T + Send,
+{
+    match rayon::ThreadPoolBuilder::new().num_threads(threads).build() {
+        Ok(pool) => pool.install(job),
+        Err(err) => {
+            eprintln!(
+                "Unable to build a {threads}-thread Rayon pool ({err}); using the global pool instead."
+            );
+            job()
+        }
+    }
 }
 
 #[inline]
@@ -812,11 +912,7 @@ fn find_s_matches_in_domain(
     };
 
     let mut matches = if let Some(t) = threads {
-        rayon::ThreadPoolBuilder::new()
-            .num_threads(t)
-            .build()
-            .unwrap()
-            .install(job)
+        install_thread_pool(t, job)
     } else {
         job()
     };
@@ -889,11 +985,7 @@ fn find_equation_matches_in_domain(
     };
 
     let mut matches = if let Some(t) = threads {
-        rayon::ThreadPoolBuilder::new()
-            .num_threads(t)
-            .build()
-            .unwrap()
-            .install(job)
+        install_thread_pool(t, job)
     } else {
         job()
     };
@@ -903,7 +995,11 @@ fn find_equation_matches_in_domain(
 }
 
 #[derive(Parser)]
-#[command(name = "stoicn", about = "STROIED-CN Interpreter & Toolkit (Rust engine)", version)]
+#[command(
+    name = "stoicn",
+    about = "STROIED-CN Interpreter & Toolkit (Rust engine)",
+    version
+)]
 struct Cli {
     #[command(subcommand)]
     command: Commands,
@@ -967,11 +1063,15 @@ enum Commands {
     },
 }
 
-fn main() {
+fn main() -> io::Result<()> {
     let cli = Cli::parse();
 
     match &cli.command {
-        Commands::Eval { expression, max_steps, max_len } => {
+        Commands::Eval {
+            expression,
+            max_steps,
+            max_len,
+        } => {
             let expr = expression.join("");
             println!("======================================================");
             println!("  STROIED-CN Interpreter (Rust)");
@@ -984,8 +1084,12 @@ fn main() {
             println!("  Steps: {}, Status: {}", res.steps, res.status);
             println!("  Time: {:.4}s\n", elapsed.as_secs_f64());
         }
-        Commands::Run { file, max_steps, max_len } => {
-            let content = fs::read_to_string(file).expect("Failed to read file");
+        Commands::Run {
+            file,
+            max_steps,
+            max_len,
+        } => {
+            let content = fs::read_to_string(file)?;
             println!("======================================================");
             println!("  STROIED-CN Interpreter (Rust)");
             println!("======================================================");
@@ -999,7 +1103,11 @@ fn main() {
                 let res = reduce_full(line, *max_steps, *max_len);
                 let elapsed = start.elapsed();
                 println!("  Result: {}", res.result);
-                println!("  Steps: {} | Time: {:.4}s\n", res.steps, elapsed.as_secs_f64());
+                println!(
+                    "  Steps: {} | Time: {:.4}s\n",
+                    res.steps,
+                    elapsed.as_secs_f64()
+                );
             }
         }
         Commands::Repl { max_steps, max_len } => {
@@ -1011,7 +1119,7 @@ fn main() {
 
             loop {
                 print!("stoicn> ");
-                io::stdout().flush().unwrap();
+                io::stdout().flush()?;
 
                 let mut input = String::new();
                 if io::stdin().read_line(&mut input).is_err() || input.trim().is_empty() {
@@ -1058,7 +1166,9 @@ fn main() {
                     }
 
                     step = (step + step_delta).min(*max_steps);
-                    if should_checkpoint_cycle(prev_len, expr.flat_len, &mut stable_steps) && !seen.insert(next) {
+                    if should_checkpoint_cycle(prev_len, expr.flat_len, &mut stable_steps)
+                        && !seen.insert(next)
+                    {
                         status = "cycle";
                         break;
                     }
@@ -1066,10 +1176,22 @@ fn main() {
 
                 let elapsed = start.elapsed();
                 println!("  Result: {}", stringify(&expr));
-                println!("  Steps: {}, Status: {}, Time: {:.4}s\n", step, status, elapsed.as_secs_f64());
+                println!(
+                    "  Steps: {}, Status: {}, Time: {:.4}s\n",
+                    step,
+                    status,
+                    elapsed.as_secs_f64()
+                );
             }
         }
-        Commands::Search { length, max_steps, max_len, filter, limit, threads } => {
+        Commands::Search {
+            length,
+            max_steps,
+            max_len,
+            filter,
+            limit,
+            threads,
+        } => {
             println!("======================================================");
             println!("  STROIED-CN Search (length={})", length);
             println!("======================================================");
@@ -1087,7 +1209,8 @@ fn main() {
                     .fold(
                         || SearchAccumulator::new(keep_limit),
                         |mut acc, index| {
-                            let result = reduce_search_candidate(index, *length, *max_steps, *max_len);
+                            let result =
+                                reduce_search_candidate(index, *length, *max_steps, *max_len);
                             let keep = match filter {
                                 Some(wanted) => wanted == result.status,
                                 None => true,
@@ -1107,11 +1230,7 @@ fn main() {
             };
 
             let mut hits = if let Some(t) = threads {
-                rayon::ThreadPoolBuilder::new()
-                    .num_threads(*t)
-                    .build()
-                    .unwrap()
-                    .install(search_job)
+                install_thread_pool(*t, search_job)
             } else {
                 search_job()
             };
@@ -1123,14 +1242,21 @@ fn main() {
                     .then_with(|| a.status.cmp(b.status))
             });
 
-            let display_limit = if *limit == 0 { hits.items.len() } else { *limit };
+            let display_limit = if *limit == 0 {
+                hits.items.len()
+            } else {
+                *limit
+            };
             for hit in hits.items.iter().take(display_limit) {
                 let display_out = if hit.out.len() > 40 {
                     format!("{}...", &hit.out[..37])
                 } else {
                     hit.out.clone()
                 };
-                println!("  {:12} {:40} {:5}  {}", hit.expr, display_out, hit.step, hit.status);
+                println!(
+                    "  {:12} {:40} {:5}  {}",
+                    hit.expr, display_out, hit.step, hit.status
+                );
             }
 
             let elapsed = start.elapsed();
@@ -1170,22 +1296,28 @@ fn main() {
                 );
             }
         }
-        Commands::Find { query, max_steps, max_len, threads, show } => {
+        Commands::Find {
+            query,
+            max_steps,
+            max_len,
+            threads,
+            show,
+        } => {
             if query.len() < 2 {
                 eprintln!("Usage: stoicn find S <domain> OR stoicn find <lhs> = <rhs> <domain>");
-                return;
+                return Ok(());
             }
 
             let domain = match query.last().and_then(|s| s.parse::<usize>().ok()) {
                 Some(d) => d,
                 None => {
                     eprintln!("Last argument must be a domain number.");
-                    return;
+                    return Ok(());
                 }
             };
             if domain == 0 {
                 eprintln!("Domain must be >= 1.");
-                return;
+                return Ok(());
             }
 
             let parts = &query[..query.len() - 1];
@@ -1199,20 +1331,22 @@ fn main() {
             } else {
                 let Some(eq_pos) = parts.iter().position(|p| p == "=") else {
                     eprintln!("Equation mode requires '='. Example: stoicn find .XYZ = XZ(YZ) 5");
-                    return;
+                    return Ok(());
                 };
                 if eq_pos == 0 || eq_pos + 1 >= parts.len() {
                     eprintln!("Equation must include both LHS and RHS.");
-                    return;
+                    return Ok(());
                 }
                 lhs_template = normalize_equation_side(&parts[..eq_pos].join(""));
                 rhs_target = normalize_equation_side(&parts[eq_pos + 1..].join(""));
                 if !lhs_template.contains('.') && !lhs_template.contains('?') {
                     eprintln!("LHS must contain '.' or '?' placeholder(s).");
-                    return;
+                    return Ok(());
                 }
 
-                let has_vars = lhs_template.contains('X') || lhs_template.contains('Y') || lhs_template.contains('Z');
+                let has_vars = lhs_template.contains('X')
+                    || lhs_template.contains('Y')
+                    || lhs_template.contains('Z');
                 if !has_vars {
                     lhs_template.push_str("XYZ");
                     auto_xyz = true;
@@ -1227,7 +1361,10 @@ fn main() {
             } else {
                 println!("  Equation checked: {} => {}", lhs_template, rhs_target);
                 if auto_xyz {
-                    println!("  Note: no XYZ variables in LHS; treated as {}.", lhs_template);
+                    println!(
+                        "  Note: no XYZ variables in LHS; treated as {}.",
+                        lhs_template
+                    );
                 }
             }
 
@@ -1269,4 +1406,6 @@ fn main() {
             }
         }
     }
+
+    Ok(())
 }
